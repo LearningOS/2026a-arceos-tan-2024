@@ -134,3 +134,30 @@ fn test_ramfs() {
     assert_eq!(root.remove("./foo"), Ok(()));
     assert!(ramfs.root_dir_node().get_entries().is_empty());
 }
+
+#[test]
+fn test_rename_preserves_file_and_validates_before_replacement() {
+    let fs = RamFileSystem::new();
+    let root = fs.root_dir();
+    root.create("dir", VfsNodeType::Dir).unwrap();
+    root.create("dir/old", VfsNodeType::File).unwrap();
+    root.create("dir/dst", VfsNodeType::File).unwrap();
+    let original = root.clone().lookup("dir/old").unwrap();
+    original.write_at(0, b"hello").unwrap();
+    root.rename("dir/old", "dir/dst").unwrap();
+    assert!(root.clone().lookup("dir/old").is_err());
+    let renamed = root.clone().lookup("dir/dst").unwrap();
+    assert!(Arc::ptr_eq(&original, &renamed));
+    let mut data = [0; 5];
+    renamed.read_at(0, &mut data).unwrap();
+    assert_eq!(&data, b"hello");
+    root.rename("dir/dst", "dir/dst").unwrap();
+    assert_eq!(
+        root.rename("dir/missing", "dir/dst"),
+        Err(VfsError::NotFound)
+    );
+    assert_eq!(root.rename("dir/dst", "other"), Err(VfsError::Unsupported));
+    assert!(root.clone().lookup("dir/dst").is_ok());
+    assert!(root.rename("dir/dst", "dir/..").is_err());
+    assert!(root.lookup("dir/dst").is_ok());
+}

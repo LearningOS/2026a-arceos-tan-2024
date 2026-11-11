@@ -2,42 +2,40 @@ use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::{string::String, vec::Vec};
 
+use super::{file::FileNode, Mutex};
 use axfs_vfs::{VfsDirEntry, VfsNodeAttr, VfsNodeOps, VfsNodeRef, VfsNodeType};
 use axfs_vfs::{VfsError, VfsResult};
-use spin::RwLock;
-
-use crate::file::FileNode;
 
 /// The directory node in the RAM filesystem.
 ///
 /// It implements [`axfs_vfs::VfsNodeOps`].
 pub struct DirNode {
     this: Weak<DirNode>,
-    parent: RwLock<Weak<dyn VfsNodeOps>>,
-    children: RwLock<BTreeMap<String, VfsNodeRef>>,
+    parent: Mutex<Weak<dyn VfsNodeOps>>,
+    children: Mutex<BTreeMap<String, VfsNodeRef>>,
 }
 
 impl DirNode {
     pub(super) fn new(parent: Option<Weak<dyn VfsNodeOps>>) -> Arc<Self> {
         Arc::new_cyclic(|this| Self {
             this: this.clone(),
-            parent: RwLock::new(parent.unwrap_or_else(|| Weak::<Self>::new())),
-            children: RwLock::new(BTreeMap::new()),
+            parent: Mutex::new(parent.unwrap_or_else(|| Weak::<Self>::new())),
+            children: Mutex::new(BTreeMap::new()),
         })
     }
 
     pub(super) fn set_parent(&self, parent: Option<&VfsNodeRef>) {
-        *self.parent.write() = parent.map_or(Weak::<Self>::new() as _, Arc::downgrade);
+        *self.parent.lock() = parent.map_or(Weak::<Self>::new() as _, Arc::downgrade);
     }
 
     /// Returns a string list of all entries in this directory.
     pub fn get_entries(&self) -> Vec<String> {
-        self.children.read().keys().cloned().collect()
+        self.children.lock().keys().cloned().collect()
     }
 
     /// Checks whether a node with the given name exists in this directory.
     pub fn exist(&self, name: &str) -> bool {
-        self.children.read().contains_key(name)
+        self.children.lock().contains_key(name)
     }
 
     /// Creates a new node with the given name and type in this directory.
@@ -51,16 +49,16 @@ impl DirNode {
             VfsNodeType::Dir => Self::new(Some(self.this.clone())),
             _ => return Err(VfsError::Unsupported),
         };
-        self.children.write().insert(name.into(), node);
+        self.children.lock().insert(name.into(), node);
         Ok(())
     }
 
     /// Removes a node by the given name in this directory.
     pub fn remove_node(&self, name: &str) -> VfsResult {
-        let mut children = self.children.write();
+        let mut children = self.children.lock();
         let node = children.get(name).ok_or(VfsError::NotFound)?;
         if let Some(dir) = node.as_any().downcast_ref::<DirNode>() {
-            if !dir.children.read().is_empty() {
+            if !dir.children.lock().is_empty() {
                 return Err(VfsError::DirectoryNotEmpty);
             }
         }
@@ -75,7 +73,7 @@ impl VfsNodeOps for DirNode {
     }
 
     fn parent(&self) -> Option<VfsNodeRef> {
-        self.parent.read().upgrade()
+        self.parent.lock().upgrade()
     }
 
     fn lookup(self: Arc<Self>, path: &str) -> VfsResult<VfsNodeRef> {
@@ -85,7 +83,7 @@ impl VfsNodeOps for DirNode {
             ".." => self.parent().ok_or(VfsError::NotFound),
             _ => self
                 .children
-                .read()
+                .lock()
                 .get(name)
                 .cloned()
                 .ok_or(VfsError::NotFound),
@@ -99,7 +97,7 @@ impl VfsNodeOps for DirNode {
     }
 
     fn read_dir(&self, start_idx: usize, dirents: &mut [VfsDirEntry]) -> VfsResult<usize> {
-        let children = self.children.read();
+        let children = self.children.lock();
         let mut children = children.iter().skip(start_idx.max(2) - 2);
         for (i, ent) in dirents.iter_mut().enumerate() {
             match i + start_idx {
@@ -127,7 +125,7 @@ impl VfsNodeOps for DirNode {
                 _ => {
                     let subdir = self
                         .children
-                        .read()
+                        .lock()
                         .get(name)
                         .ok_or(VfsError::NotFound)?
                         .clone();
@@ -151,7 +149,7 @@ impl VfsNodeOps for DirNode {
                 _ => {
                     let subdir = self
                         .children
-                        .read()
+                        .lock()
                         .get(name)
                         .ok_or(VfsError::NotFound)?
                         .clone();
@@ -163,6 +161,50 @@ impl VfsNodeOps for DirNode {
         } else {
             self.remove_node(name)
         }
+    }
+
+    fn rename(&self, src_path: &str, dst_path: &str) -> VfsResult {
+        let src = axfs_vfs::path::canonicalize(src_path);
+        let dst = axfs_vfs::path::canonicalize(dst_path);
+        let (src_parent, src_name) = src.rsplit_once('/').unwrap_or(("", &src));
+        let (dst_parent, dst_name) = dst.rsplit_once('/').unwrap_or(("", &dst));
+        if src_name.is_empty()
+            || dst_name.is_empty()
+            || src_name == "."
+            || src_name == ".."
+            || dst_name == "."
+            || dst_name == ".."
+        {
+            return Err(VfsError::InvalidInput);
+        }
+        // This exercise supports renaming within one directory, not moving.
+        if src_parent != dst_parent {
+            return Err(VfsError::Unsupported);
+        }
+        if !src_parent.trim_matches('/').is_empty() {
+            return self
+                .this
+                .upgrade()
+                .ok_or(VfsError::NotFound)?
+                .lookup(src_parent)?
+                .rename(src_name, dst_name);
+        }
+        let mut children = self.children.lock();
+        let node = children.get(src_name).ok_or(VfsError::NotFound)?.clone();
+        if src_name == dst_name {
+            return Ok(());
+        }
+        if node.get_attr()?.is_dir() {
+            return Err(VfsError::IsADirectory);
+        }
+        if let Some(target) = children.get(dst_name) {
+            if target.get_attr()?.is_dir() {
+                return Err(VfsError::IsADirectory);
+            }
+        }
+        children.remove(src_name);
+        children.insert(dst_name.into(), node);
+        Ok(())
     }
 
     axfs_vfs::impl_vfs_dir_default! {}

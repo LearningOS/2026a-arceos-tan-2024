@@ -18,6 +18,7 @@ pub use self::file::FileNode;
 use alloc::sync::Arc;
 use axfs_vfs::{VfsNodeRef, VfsOps, VfsResult};
 use spin::once::Once;
+use spin::Mutex;
 
 /// A RAM filesystem that implements [`axfs_vfs::VfsOps`].
 pub struct RamFileSystem {

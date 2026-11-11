@@ -1,29 +1,29 @@
+use super::Mutex;
 use alloc::vec::Vec;
 use axfs_vfs::{impl_vfs_non_dir_default, VfsNodeAttr, VfsNodeOps, VfsResult};
-use spin::RwLock;
 
 /// The file node in the RAM filesystem.
 ///
 /// It implements [`axfs_vfs::VfsNodeOps`].
 pub struct FileNode {
-    content: RwLock<Vec<u8>>,
+    content: Mutex<Vec<u8>>,
 }
 
 impl FileNode {
     pub(super) const fn new() -> Self {
         Self {
-            content: RwLock::new(Vec::new()),
+            content: Mutex::new(Vec::new()),
         }
     }
 }
 
 impl VfsNodeOps for FileNode {
     fn get_attr(&self) -> VfsResult<VfsNodeAttr> {
-        Ok(VfsNodeAttr::new_file(self.content.read().len() as _, 0))
+        Ok(VfsNodeAttr::new_file(self.content.lock().len() as _, 0))
     }
 
     fn truncate(&self, size: u64) -> VfsResult {
-        let mut content = self.content.write();
+        let mut content = self.content.lock();
         if size < content.len() as u64 {
             content.truncate(size as _);
         } else {
@@ -33,7 +33,7 @@ impl VfsNodeOps for FileNode {
     }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> VfsResult<usize> {
-        let content = self.content.read();
+        let content = self.content.lock();
         let start = content.len().min(offset as usize);
         let end = content.len().min(offset as usize + buf.len());
         let src = &content[start..end];
@@ -43,7 +43,7 @@ impl VfsNodeOps for FileNode {
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> VfsResult<usize> {
         let offset = offset as usize;
-        let mut content = self.content.write();
+        let mut content = self.content.lock();
         if offset + buf.len() > content.len() {
             content.resize(offset + buf.len(), 0);
         }

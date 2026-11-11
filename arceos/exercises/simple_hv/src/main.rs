@@ -3,31 +3,36 @@
 #![feature(asm_const)]
 #![feature(riscv_ext_intrinsics)]
 
+extern crate alloc;
 #[cfg(feature = "axstd")]
 extern crate axstd as std;
-extern crate alloc;
 #[macro_use]
 extern crate axlog;
 
+mod csrs;
+mod loader;
+mod regs;
+mod sbi;
 mod task;
 mod vcpu;
-mod regs;
-mod csrs;
-mod sbi;
-mod loader;
 
-use vcpu::VmCpuRegisters;
-use riscv::register::{scause, sstatus, stval};
-use csrs::defs::hstatus;
-use tock_registers::LocalRegisterCopy;
-use csrs::{RiscvCsrTrait, CSR};
-use vcpu::_run_guest;
-use sbi::SbiMessage;
-use loader::load_vm_image;
-use axhal::mem::PhysAddr;
 use crate::regs::GprIndex::{A0, A1};
+use alloc::boxed::Box;
+use axhal::mem::PhysAddr;
+use csrs::defs::hstatus;
+use csrs::{RiscvCsrTrait, CSR};
+use loader::load_vm_image;
+use riscv::register::{scause, sstatus, stval};
+use sbi::SbiMessage;
+use tock_registers::LocalRegisterCopy;
+use vcpu::VmCpuRegisters;
+use vcpu::_run_guest;
 
 const VM_ENTRY: usize = 0x8020_0000;
+
+// Sv39x4 uses a 16 KiB root table, unlike the host's 4 KiB Sv39 root.
+#[repr(C, align(16384))]
+struct GuestPageTable([u64; 2048]);
 
 #[cfg_attr(feature = "axstd", no_mangle)]
 fn main() {
@@ -47,17 +52,30 @@ fn main() {
 
     // Setup pagetable for 2nd address mapping.
     let ept_root = uspace.page_table_root();
-    prepare_vm_pgtable(ept_root);
+    let _guest_root = prepare_vm_pgtable(ept_root);
 
     // Kick off vm and wait for it to exit.
-    while !run_guest(&mut ctx) {
+    while !run_guest(&mut ctx) {}
+
+    unsafe {
+        core::arch::asm!("csrw hgatp, zero");
+        core::arch::riscv64::hfence_gvma_all();
     }
 
-    panic!("Hypervisor ok!");
+    ax_println!("Hypervisor ok!");
 }
 
-fn prepare_vm_pgtable(ept_root: PhysAddr) {
-    let hgatp = 8usize << 60 | usize::from(ept_root) >> 12;
+fn prepare_vm_pgtable(ept_root: PhysAddr) -> Box<GuestPageTable> {
+    let mut root = Box::new(GuestPageTable([0; 2048]));
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            axhal::mem::phys_to_virt(ept_root).as_ptr().cast::<u64>(),
+            root.0.as_mut_ptr(),
+            512,
+        );
+    }
+    let root_paddr = axhal::mem::virt_to_phys((root.0.as_ptr() as usize).into());
+    let hgatp = 8usize << 60 | usize::from(root_paddr) >> 12;
     unsafe {
         core::arch::asm!(
             "csrw hgatp, {hgatp}",
@@ -65,14 +83,28 @@ fn prepare_vm_pgtable(ept_root: PhysAddr) {
         );
         core::arch::riscv64::hfence_gvma_all();
     }
+    root
 }
 
 fn run_guest(ctx: &mut VmCpuRegisters) -> bool {
+    // A timer interrupt during the assembly transition would enter the guest
+    // exit vector with partially restored host registers. Mask HS interrupts
+    // until host state and the exit cause have both been recovered.
+    let irqs_enabled = axhal::arch::irqs_enabled();
+    axhal::arch::disable_irqs();
+    let saved_sie: usize;
     unsafe {
+        core::arch::asm!("csrrw {}, sie, zero", out(reg) saved_sie);
         _run_guest(ctx);
     }
-
-    vmexit_handler(ctx)
+    let stopped = vmexit_handler(ctx);
+    unsafe {
+        core::arch::asm!("csrw sie, {}", in(reg) saved_sie);
+    }
+    if irqs_enabled {
+        axhal::arch::enable_irqs();
+    }
+    stopped
 }
 
 #[allow(unreachable_code)]
@@ -94,25 +126,33 @@ fn vmexit_handler(ctx: &mut VmCpuRegisters) -> bool {
                         assert_eq!(a1, 0x1234);
                         ax_println!("Shutdown vm normally!");
                         return true;
-                    },
+                    }
                     _ => todo!(),
                 }
             } else {
                 panic!("bad sbi message! ");
             }
-        },
+        }
         Trap::Exception(Exception::IllegalInstruction) => {
-            panic!("Bad instruction: {:#x} sepc: {:#x}",
-                stval::read(),
-                ctx.guest_regs.sepc
+            // mhartid is machine-only. Supply the virtual hart identity when
+            // the guest reads it with CSRRS rd, mhartid, zero.
+            let instruction = stval::read();
+            assert_eq!(
+                instruction & 0xffff_f07f,
+                0xf140_2073,
+                "unsupported guest instruction"
             );
-        },
+            let rd = regs::GprIndex::from_raw(((instruction >> 7) & 31) as u32).unwrap();
+            ctx.guest_regs.gprs.set_reg(rd, 0x1234);
+            ctx.guest_regs.sepc += 4;
+        }
         Trap::Exception(Exception::LoadGuestPageFault) => {
-            panic!("LoadGuestPageFault: stval{:#x} sepc: {:#x}",
-                stval::read(),
-                ctx.guest_regs.sepc
-            );
-        },
+            // The guest's ld a0, 64(zero) reads a virtual device register.
+            // Emulate this MMIO access without mapping the zero page as RAM.
+            assert_eq!(stval::read(), 0x40, "unsupported guest MMIO address");
+            ctx.guest_regs.gprs.set_reg(A0, 0x6688);
+            ctx.guest_regs.sepc += 4;
+        }
         _ => {
             panic!(
                 "Unhandled trap: {:?}, sepc: {:#x}, stval: {:#x}",
@@ -127,9 +167,8 @@ fn vmexit_handler(ctx: &mut VmCpuRegisters) -> bool {
 
 fn prepare_guest_context(ctx: &mut VmCpuRegisters) {
     // Set hstatus
-    let mut hstatus = LocalRegisterCopy::<usize, hstatus::Register>::new(
-        riscv::register::hstatus::read().bits(),
-    );
+    let mut hstatus =
+        LocalRegisterCopy::<usize, hstatus::Register>::new(riscv::register::hstatus::read().bits());
     // Set Guest bit in order to return to guest mode.
     hstatus.modify(hstatus::spv::Guest);
     // Set SPVP bit in order to accessing VS-mode memory from HS-mode.
@@ -140,7 +179,7 @@ fn prepare_guest_context(ctx: &mut VmCpuRegisters) {
     // Set sstatus in guest mode.
     let mut sstatus = sstatus::read();
     sstatus.set_spp(sstatus::SPP::Supervisor);
-    ctx.guest_regs.sstatus = sstatus.bits();
+    ctx.guest_regs.sstatus = sstatus.bits() & !(1 << 1);
     // Return to entry to start vm.
     ctx.guest_regs.sepc = VM_ENTRY;
 }
