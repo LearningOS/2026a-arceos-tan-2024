@@ -1,0 +1,58 @@
+{
+  "schema": 1,
+  "courseId": 2078,
+  "repository": "LearningOS/2026a-arceos-tan-2024",
+  "commit": "3b8e2b2fbca48cc5297af89ee2e08828ba1d7f73",
+  "score": 600,
+  "totalScore": 600,
+  "exercises": [
+    {
+      "name": "print_with_color",
+      "max": 100,
+      "score": 100,
+      "status": "pass",
+      "exitCode": 0
+    },
+    {
+      "name": "ramfs_rename",
+      "max": 100,
+      "score": 100,
+      "status": "pass",
+      "exitCode": 0
+    },
+    {
+      "name": "alt_alloc",
+      "max": 100,
+      "score": 100,
+      "status": "pass",
+      "exitCode": 0
+    },
+    {
+      "name": "support_hashmap",
+      "max": 100,
+      "score": 100,
+      "status": "pass",
+      "exitCode": 0
+    },
+    {
+      "name": "sys_map",
+      "max": 100,
+      "score": 100,
+      "status": "pass",
+      "exitCode": 0
+    },
+    {
+      "name": "simple_hv",
+      "max": 100,
+      "score": 100,
+      "status": "pass",
+      "exitCode": 0
+    }
+  ],
+  "student": "tan-2024",
+  "runId": "43022706136",
+  "runAttempt": "1",
+  "upload": {
+    "status": "pending"
+  }
+}
